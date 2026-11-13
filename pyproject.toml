@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 gflow = "gflow.cli.main:cli"
+gflow-magpie-bridge = "gflow.magpie_bridge:main"
 
 [tool.setuptools.packages.find]
 include = ["gflow*"]

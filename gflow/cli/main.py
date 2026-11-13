@@ -1,8 +1,8 @@
 """
 gflow CLI — Command-line interface to Google Flow.
 
-Uses Google's Imagen 4 and Veo 3.1 via the reverse-engineered
-aisandbox-pa.googleapis.com endpoints with cookie-based auth.
+Uses Google's Flow image menu models (Pro / 2.1 / 2 Lite) and Veo 3.1 via
+the reverse-engineered aisandbox-pa.googleapis.com endpoints with cookie auth.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from rich.panel import Panel
 from gflow import __version__
 from gflow.auth import BrowserAuth, AuthData, load_env, save_env, refresh_access_token, kill_auth_browser
 from gflow.auth.browser_auth import clear_env, AuthError
-from gflow.api.client import FlowClient, FlowAPIError
+from gflow.api.client import FlowClient, FlowAPIError, IMAGE_MODELS
 from gflow.api.models import (
     AssetType,
     ExtendVideoRequest,
@@ -141,6 +141,9 @@ def close_browser(ctx):
 
 @cli.command("generate-image")
 @click.argument("prompt")
+@click.option("--model", default="nano-banana-2.1",
+              type=click.Choice(sorted(IMAGE_MODELS)),
+              help="Flow menu image model (Pro / 2.1 / 2 Lite)")
 @click.option("--aspect-ratio", default="landscape",
               type=click.Choice(["square", "portrait", "landscape", "4:3", "1:1", "16:9", "9:16"]),
               help="Image aspect ratio")
@@ -149,19 +152,20 @@ def close_browser(ctx):
 @click.option("-o", "--output", default=None, help="Output file path (auto-named if omitted)")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def generate_image(ctx, prompt, aspect_ratio, seed, num, output, as_json):
-    """Generate images from a text prompt using Imagen 4.
+def generate_image(ctx, prompt, model, aspect_ratio, seed, num, output, as_json):
+    """Generate images from a text prompt using a Flow menu model.
 
     \b
     Examples:
         gflow generate-image "a cat astronaut floating in space"
-        gflow generate-image "sunset over mountains" --aspect-ratio landscape --num 4
+        gflow generate-image "a poster" --model nano-banana-pro --aspect-ratio portrait
         gflow generate-image "logo design" --aspect-ratio square -o logo.png
     """
     client = _get_client(ctx.obj["debug"])
 
     req = GenerateImageRequest(
         prompt=prompt,
+        model=model,
         aspect_ratio=aspect_ratio,
         seed=seed,
         num_images=num,
@@ -885,7 +889,7 @@ def sniff_network(ctx, duration, output):
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
-    from gflow.auth.browser_auth import ENV_DIR, FLOW_URL
+    from gflow.auth.browser_auth import env_dir, FLOW_URL
 
     print()
     print("=" * 60)
@@ -907,7 +911,7 @@ def sniff_network(ctx, duration, output):
     chrome_options.add_experimental_option("useAutomationExtension", False)
 
     # Reuse the persistent profile (already logged in)
-    profile_dir = str(ENV_DIR / "chrome-profile")
+    profile_dir = str(env_dir() / "chrome-profile")
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
 
     # Enable performance logging for network capture

@@ -48,8 +48,16 @@ logger = logging.getLogger("gflow.api")
 SANDBOX_BASE = "https://aisandbox-pa.googleapis.com"
 LABS_BASE = "https://labs.google/fx/api"
 
-# Internal model names (discovered from sniff)
-IMAGE_MODEL = "NARWHAL"  # Imagen 4 internal name
+# Internal model names (discovered from sniff). Flow's current image menu
+# exposes three gems; Imagen 4 / NARWHAL were retired in 2026-10. The REST
+# batchGenerateImages endpoint returns these same codes as modelNameType.
+IMAGE_MODEL = "BELUGA"  # Nano Banana 2.1 (Flow menu default flash model)
+IMAGE_MODELS = {
+    # public id                  wire imageModelName / modelNameType
+    "nano-banana-pro":           "GEM_PIX_2",
+    "nano-banana-2.1":           "BELUGA",
+    "nano-banana-2-lite":        "HARBOR_SEAL",
+}
 VIDEO_MODEL = "veo_3_1_t2v_fast_ultra"  # Veo 3.1 fast/ultra
 TOOL_NAME = "PINHOLE"  # Flow's internal tool name
 
@@ -85,8 +93,15 @@ EXTEND_MODEL_MAP = {
 }
 
 
+def _proxy_file() -> Path:
+    """Return the active gflow home's proxy list (per-account for the bridge)."""
+    from gflow.auth.browser_auth import gflow_home
+
+    return gflow_home() / "proxies.txt"
+
+
 def _load_proxies() -> list[str]:
-    """Load residential proxy list from ~/.gflow/proxies.txt.
+    """Load residential proxy list from <GFLOW_HOME>/proxies.txt.
 
     File format: one proxy per line as user:pass@host:port
     Lines starting with # are ignored. Empty lines are ignored.
@@ -95,7 +110,7 @@ def _load_proxies() -> list[str]:
     Proxies are NOT shuffled — the first working proxy is used for the
     entire session (sticky IP).  Only rotates on failure.
     """
-    proxy_file = Path.home() / ".gflow" / "proxies.txt"
+    proxy_file = _proxy_file()
     if not proxy_file.exists():
         return []
 
@@ -120,7 +135,7 @@ def get_active_proxy() -> str | None:
 
     Returns None if no proxies are configured.
     """
-    proxy_file = Path.home() / ".gflow" / "proxies.txt"
+    proxy_file = _proxy_file()
     if not proxy_file.exists():
         return None
 
@@ -161,8 +176,9 @@ class FlowClient:
     3. Cookie auth for labs.google
     """
 
-    def __init__(self, cookies: str, *, debug: bool = False):
+    def __init__(self, cookies: str, *, debug: bool = False, interactive_auth: bool = True):
         self.debug = debug or os.environ.get("GFLOW_DEBUG") == "true"
+        self.interactive_auth = interactive_auth and os.environ.get("GFLOW_NONINTERACTIVE") != "1" and os.environ.get("GFLOW_NO_BROWSER") != "1"
         self.cookies = cookies
         self._access_token: str = ""
         self._project_id: str = ""
@@ -233,17 +249,24 @@ class FlowClient:
         2. Silent CDP cookie refresh from running Chrome (no user interaction)
         3. Full browser re-authentication (last resort — requires user login)
         """
-        # Tier 1: Try existing cookies
+        # Tier 1: Try existing cookies. `except ... as` deletes its target at
+        # the end of the block, so keep the error under a separate name for
+        # the Tier-2/3 paths that re-raise it below.
+        first_error: AuthError | None = None
         try:
             data = refresh_access_token(self.cookies, debug=self.debug)
             self._apply_token(data)
             return
-        except AuthError as original_err:
+        except AuthError as exc:
+            first_error = exc
             logger.info("Tier 1 failed (existing cookies expired)")
 
         # Tier 2: Silent CDP cookie refresh — re-extract cookies from the
-        # Chrome instance that's already running (Google rotates cookies
-        # but Chrome tracks them automatically)
+        # Chrome instance that's already running (no user interaction).
+        # The magpie bridge skips this: its account cookies are the source of
+        # truth and another browser's cookies must never replace them.
+        if not self.interactive_auth:
+            raise first_error
         logger.info("Trying silent CDP cookie refresh (no user interaction)...")
         refreshed = refresh_cookies_from_cdp()
         if refreshed and refreshed.is_valid:
@@ -260,7 +283,7 @@ class FlowClient:
         logger.info("Falling back to full browser re-authentication...")
         new_cookies = self._re_authenticate()
         if not new_cookies:
-            raise original_err
+            raise first_error
         data = refresh_access_token(self.cookies, debug=self.debug)
         self._apply_token(data)
 
@@ -289,6 +312,8 @@ class FlowClient:
 
     def _re_authenticate(self) -> str | None:
         """Re-authenticate via browser and update cookies in-place (Tier 3 — last resort)."""
+        if not self.interactive_auth:
+            return None
         try:
             from gflow.auth import BrowserAuth, save_env
             browser_auth = BrowserAuth(debug=self.debug)
@@ -362,7 +387,7 @@ class FlowClient:
                     # On second attempt, also try refreshing cookies silently
                     # (Google may have rotated session cookies, causing the
                     # access token to be rejected alongside the reCAPTCHA token)
-                    if attempt >= 1:
+                    if attempt >= 1 and self.interactive_auth:
                         logger.info("Also attempting silent CDP cookie refresh...")
                         refreshed = refresh_cookies_from_cdp()
                         if refreshed and refreshed.is_valid:
@@ -469,7 +494,7 @@ class FlowClient:
         """Create a project by running fetch() inside the Chrome browser via CDP.
 
         Key requirements for this to work:
-        1. The Chrome tab MUST be on labs.google — the browser enforces Origin
+        1. The Chrome tab MUST be on Flow — the browser enforces Origin
            based on the current page, and custom Origin headers in fetch() are
            silently ignored. If the tab is on chrome://newtab, the Origin will
            be wrong and Google rejects with 401.
@@ -483,17 +508,19 @@ class FlowClient:
                 logger.warning("No CDP WebSocket available for project creation")
                 return None
 
-            # CRITICAL: Ensure the tab is on labs.google/fx
-            # Browser sets Origin from the current page — if the tab navigated
-            # away (login redirect, error, etc.), the Origin will be wrong and
-            # Google returns 401. Navigate there first.
+            # CRITICAL: Ensure the tab is on Flow. Browser sets Origin from the
+            # current page — if the tab navigated away (login redirect, error,
+            # etc.), the Origin will be wrong and Google returns 401.
             current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
-            if not current_url or "labs.google/fx" not in str(current_url):
+            if not current_url or not (
+                str(current_url).startswith("https://flow.google.com/")
+                or "labs.google/fx" in str(current_url)
+            ):
                 logger.info("CDP tab not on Flow page (url=%s), navigating...", current_url)
                 # Navigate to Flow — this sets the correct Origin for fetch()
                 nav_js = """
                     new Promise((resolve) => {
-                        window.location.href = 'https://labs.google/fx/tools/flow';
+                        window.location.href = 'https://flow.google.com/';
                         // Wait for navigation to complete
                         setTimeout(() => resolve('navigated'), 5000);
                     })
@@ -502,7 +529,10 @@ class FlowClient:
                 # Re-verify we're on the right page
                 time.sleep(3)
                 current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
-                if not current_url or "labs.google" not in str(current_url):
+                if not current_url or not (
+                    str(current_url).startswith("https://flow.google.com/")
+                    or "labs.google" in str(current_url)
+                ):
                     logger.warning("CDP: could not navigate to Flow page (url=%s)", current_url)
                     ws.close()
                     return None
@@ -669,16 +699,40 @@ class FlowClient:
     # ------------------------------------------------------------------
 
     def generate_image(self, req: GenerateImageRequest) -> list[Asset]:
-        """
-        Generate images using Imagen 4 (NARWHAL).
+        """Generate images using the selected Flow menu model.
 
-        POST /v1/projects/{pid}/flowMedia:batchGenerateImages
+        The retired aisandbox-pa REST endpoint now depends on a session token
+        endpoint that answers 410. Prefer the new Angular frontend's
+        batchexecute RPCs when the account's Chrome is live; keep the legacy
+        REST path for setups where a real user can re-authenticate.
         """
+        if req.model not in IMAGE_MODELS:
+            raise ValueError(f"unknown Flow image model {req.model!r}; expected one of {sorted(IMAGE_MODELS)}")
+        try:
+            import gflow.api.newflow as _newflow
+        except ImportError:
+            _newflow = None
+        if _newflow is not None:
+            try:
+                return _newflow.generate_images(
+                    model=req.model,
+                    prompt=req.prompt,
+                    aspect_ratio=req.aspect_ratio,
+                    num_images=req.num_images,
+                    seed=req.seed,
+                    debug=self.debug,
+                )
+            except _newflow.NewFlowUnavailable as exc:
+                # No live CDP Chrome: keep the legacy path for environments
+                # where an interactive user can re-authenticate.
+                logger.info("New Flow RPC unavailable (%s), trying legacy REST", exc)
+
         self._ensure_token()
         project_id = self._ensure_project()
 
         url = f"{SANDBOX_BASE}/v1/projects/{project_id}/flowMedia:batchGenerateImages"
         aspect = IMAGE_ASPECT_MAP.get(req.aspect_ratio.lower(), "IMAGE_ASPECT_RATIO_LANDSCAPE")
+        image_model = IMAGE_MODELS[req.model]
         seed = req.seed if req.seed is not None else random.randint(10000, 99999)
 
         def _do_generate():
@@ -695,7 +749,7 @@ class FlowClient:
             for i in range(req.num_images):
                 img_req = {
                     "clientContext": client_ctx,
-                    "imageModelName": IMAGE_MODEL,
+                    "imageModelName": image_model,
                     "imageAspectRatio": aspect,
                     "structuredPrompt": {
                         "parts": [{"text": req.prompt}],
@@ -716,7 +770,7 @@ class FlowClient:
                 safe = json.dumps(data, indent=2)[:1000]
                 logger.info("Image response:\n%s", safe)
 
-            return self._parse_image_response(data, req.prompt)
+            return self._parse_image_response(data, req.prompt, image_model)
 
         return self._with_recaptcha_retry(_do_generate)
 
@@ -1204,11 +1258,13 @@ class FlowClient:
         targets = json.loads(resp.read().decode())
 
         ws_url = None
-        # Prefer a tab on labs.google
+        # Prefer a tab on the current or legacy Flow host.
         for target in targets:
-            if target.get("type") == "page" and "labs.google" in target.get("url", ""):
-                ws_url = target.get("webSocketDebuggerUrl", "")
-                break
+            if target.get("type") == "page":
+                page_url = target.get("url", "")
+                if page_url.startswith("https://flow.google.com/") or "labs.google" in page_url:
+                    ws_url = target.get("webSocketDebuggerUrl", "")
+                    break
         # Fall back to any page tab
         if not ws_url:
             for target in targets:
@@ -1260,23 +1316,27 @@ class FlowClient:
             return None
 
     def _ensure_cdp_on_flow_page(self, ws) -> bool:
-        """Ensure the CDP tab is on labs.google/fx so fetch() has correct Origin.
+        """Ensure the CDP tab is on Flow so fetch() has the correct Origin.
 
         Browsers silently ignore custom Origin headers in fetch() — the Origin
-        is always set from the current page. If the tab isn't on labs.google,
-        same-origin requests to labs.google will fail and cross-origin requests
-        to aisandbox-pa won't have the right Origin/Referer.
+        is always set from the current page. If the tab isn't on Flow,
+        same-origin requests will fail and cross-origin requests to the
+        sandbox API won't have the right Origin/Referer.
 
         Returns True if the tab is (or was navigated to) the Flow page.
         """
+        def on_flow_page(url: object) -> bool:
+            value = str(url or "")
+            return value.startswith("https://flow.google.com/") or "labs.google" in value
+
         current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
-        if current_url and "labs.google" in str(current_url):
+        if on_flow_page(current_url):
             return True
 
         logger.info("CDP tab not on Flow page (url=%s), navigating...", current_url)
         nav_js = """
             new Promise((resolve) => {
-                window.location.href = 'https://labs.google/fx/tools/flow';
+                window.location.href = 'https://flow.google.com/';
                 setTimeout(() => resolve('navigated'), 5000);
             })
         """
@@ -1284,7 +1344,7 @@ class FlowClient:
         time.sleep(3)
 
         current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
-        if current_url and "labs.google" in str(current_url):
+        if on_flow_page(current_url):
             logger.info("CDP tab now on: %s", current_url)
             return True
 
@@ -1461,7 +1521,7 @@ class FlowClient:
     # Response Parsers
     # ------------------------------------------------------------------
 
-    def _parse_image_response(self, data: dict, prompt: str) -> list[Asset]:
+    def _parse_image_response(self, data: dict, prompt: str, image_model: str = IMAGE_MODEL) -> list[Asset]:
         """Parse flowMedia:batchGenerateImages response.
 
         Real response format:
@@ -1473,7 +1533,7 @@ class FlowClient:
                 "seed": 12345,
                 "mediaGenerationId": "...",
                 "prompt": "...",
-                "modelNameType": "NARWHAL",
+                "modelNameType": "BELUGA",
                 "fifeUrl": "https://storage.googleapis.com/...",
                 ...
               }
@@ -1495,7 +1555,7 @@ class FlowClient:
                     asset_type=AssetType.IMAGE,
                     url=url,
                     prompt=img_data.get("prompt", prompt),
-                    model=img_data.get("modelNameType", IMAGE_MODEL),
+                    model=img_data.get("modelNameType", image_model),
                     raw=img_data,
                 )
                 assets.append(asset)
@@ -1510,7 +1570,7 @@ class FlowClient:
                         name=f"image-{i}",
                         asset_type=AssetType.IMAGE,
                         prompt=img.get("prompt", prompt),
-                        model=img.get("modelNameType", IMAGE_MODEL),
+                        model=img.get("modelNameType", image_model),
                         raw=img,
                     )
                     assets.append(asset)
@@ -1523,7 +1583,7 @@ class FlowClient:
                     name=f"image-{i}",
                     asset_type=AssetType.IMAGE,
                     prompt=prompt,
-                    model=IMAGE_MODEL,
+                    model=image_model,
                     raw=img,
                 )
                 assets.append(asset)

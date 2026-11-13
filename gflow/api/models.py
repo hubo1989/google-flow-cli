@@ -36,8 +36,9 @@ class Asset(BaseModel):
 
 
 class GenerateImageRequest(BaseModel):
-    """Request to generate images using Imagen 4."""
+    """One Flow menu image model generation request."""
     prompt: str
+    model: str = "nano-banana-2.1"  # nano-banana-pro / nano-banana-2.1 / nano-banana-2-lite
     aspect_ratio: str = "landscape"  # square, portrait, landscape, 4:3
     seed: int | None = None
     num_images: int = 1  # Number of images to generate (1-8)

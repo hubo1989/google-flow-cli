@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import urllib.request
@@ -33,7 +34,7 @@ logger = logging.getLogger("gflow.recaptcha")
 RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
 
 # Flow URL to load for reCAPTCHA context
-FLOW_URL = "https://labs.google/fx/tools/flow"
+FLOW_URL = "https://flow.google.com/"
 
 
 class RecaptchaProvider:
@@ -100,6 +101,12 @@ class RecaptchaProvider:
 
         port = get_saved_cdp_port()
         if not port:
+            if os.environ.get("GFLOW_NONINTERACTIVE") == "1" or os.environ.get("GFLOW_NO_BROWSER") == "1":
+                raise RecaptchaError(
+                    "No Chrome CDP session is available for this gflow account. "
+                    "Open the account's Flow browser with the gflow CLI before generating; "
+                    "the magpie provider never launches a browser."
+                )
             logger.info("No Chrome session found — auto-launching auth browser...")
             port = self._auto_launch_chrome()
             if not port:
@@ -147,7 +154,7 @@ class RecaptchaProvider:
         import subprocess
         from gflow.auth.browser_auth import (
             _get_chrome_path, _find_free_port, save_cdp_port,
-            _wait_for_cdp_page, ENV_DIR,
+            _wait_for_cdp_page, env_dir,
         )
 
         try:
@@ -156,7 +163,7 @@ class RecaptchaProvider:
             return None
 
         cdp_port = _find_free_port()
-        profile_dir = str(ENV_DIR / "chrome-profile")
+        profile_dir = str(env_dir() / "chrome-profile")
 
         args = [
             chrome_path,
@@ -219,7 +226,7 @@ class RecaptchaProvider:
         return cdp_port
 
     def _find_flow_tab(self, port: int) -> str | None:
-        """Find a tab that's already on labs.google/fx."""
+        """Find a tab already on the current or legacy Flow domain."""
         try:
             url = f"http://127.0.0.1:{port}/json/list"
             resp = urllib.request.urlopen(url, timeout=5)
@@ -228,7 +235,7 @@ class RecaptchaProvider:
             for target in targets:
                 if target.get("type") == "page":
                     page_url = target.get("url", "")
-                    if "labs.google/fx" in page_url:
+                    if page_url.startswith("https://flow.google.com/") or "labs.google/fx" in page_url:
                         return target.get("webSocketDebuggerUrl", "")
         except Exception as e:
             if self.debug:

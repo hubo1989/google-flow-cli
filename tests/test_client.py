@@ -5,10 +5,12 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from gflow.auth.browser_auth import AuthError
+
 from gflow.api.client import (
     FlowClient, FlowAPIError,
     IMAGE_ASPECT_MAP, VIDEO_ASPECT_MAP,
-    IMAGE_MODEL, VIDEO_MODEL, TOOL_NAME,
+    IMAGE_MODEL, IMAGE_MODELS, VIDEO_MODEL, TOOL_NAME,
 )
 from gflow.api.models import Asset, AssetType, GenerateImageRequest, GenerateVideoRequest
 
@@ -16,14 +18,29 @@ from gflow.api.models import Asset, AssetType, GenerateImageRequest, GenerateVid
 class TestConstants:
     """Test internal constants match what we discovered."""
 
-    def test_image_model(self):
-        assert IMAGE_MODEL == "NARWHAL"
+    def test_image_models(self):
+        assert IMAGE_MODEL == "BELUGA"
+        assert IMAGE_MODELS == {
+            "nano-banana-pro": "GEM_PIX_2",
+            "nano-banana-2.1": "BELUGA",
+            "nano-banana-2-lite": "HARBOR_SEAL",
+        }
 
     def test_video_model(self):
         assert VIDEO_MODEL == "veo_3_1_t2v_fast_ultra"
 
     def test_tool_name(self):
         assert TOOL_NAME == "PINHOLE"
+
+
+class TestTokenRefresh:
+    """Non-interactive token failures must surface the original AuthError."""
+
+    @patch("gflow.api.client.refresh_access_token", side_effect=AuthError("cookies expired"))
+    def test_noninteractive_reraises_auth_error(self, mock_refresh):
+        client = FlowClient(cookies="test", interactive_auth=False)
+        with pytest.raises(AuthError, match="cookies expired"):
+            client._refresh_token()
 
 
 class TestAspectRatioMapping:
@@ -61,7 +78,7 @@ class TestParseImageResponse:
                         "encodedImage": "abc123base64",
                         "mediaGenerationId": "media-001",
                         "prompt": "a cat",
-                        "modelNameType": "NARWHAL",
+                        "modelNameType": "BELUGA",
                     },
                 ]
             }]
@@ -128,7 +145,20 @@ class TestClientInit:
 
 
 class TestImagePayload:
-    """Test that generate_image builds correct payload."""
+    """Test that generate_image builds the legacy REST payload.
+
+    The live client prefers new-flow batchexecute RPCs; the fixture forces
+    NewFlowUnavailable so these assertions exercise the fallback contract.
+    """
+
+    @pytest.fixture(autouse=True)
+    def legacy_image_path(self, monkeypatch):
+        import gflow.api.newflow as newflow
+
+        def unavailable(**kwargs):
+            raise newflow.NewFlowUnavailable("no CDP in unit test")
+
+        monkeypatch.setattr(newflow, "generate_images", unavailable)
 
     @patch.object(FlowClient, '_get_recaptcha_token', return_value="fake-recaptcha-token")
     @patch.object(FlowClient, '_sandbox_request')
@@ -153,11 +183,37 @@ class TestImagePayload:
         assert payload["clientContext"]["recaptchaContext"]["token"] == "fake-recaptcha-token"
         assert payload["useNewMedia"] is True
         assert len(payload["requests"]) == 2
-        assert payload["requests"][0]["imageModelName"] == "NARWHAL"
+        assert payload["requests"][0]["imageModelName"] == "BELUGA"
         assert payload["requests"][0]["structuredPrompt"]["parts"][0]["text"] == "a cat in space"
         assert payload["requests"][0]["seed"] == 42
         assert payload["requests"][0]["imageAspectRatio"] == "IMAGE_ASPECT_RATIO_LANDSCAPE"
         assert payload["requests"][0]["imageInputs"] == []
+
+    @pytest.mark.parametrize("model,wire", [
+        ("nano-banana-pro", "GEM_PIX_2"),
+        ("nano-banana-2.1", "BELUGA"),
+        ("nano-banana-2-lite", "HARBOR_SEAL"),
+    ])
+    @patch.object(FlowClient, '_get_recaptcha_token', return_value="fake-recaptcha-token")
+    @patch.object(FlowClient, '_sandbox_request')
+    @patch.object(FlowClient, '_ensure_project', return_value="proj-123")
+    @patch.object(FlowClient, '_ensure_token')
+    def test_selects_each_flow_menu_model(self, mock_token, mock_proj, mock_request,
+                                          mock_captcha, model, wire):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"responses": [{"generatedImages": []}]}
+        mock_request.return_value = mock_resp
+        client = FlowClient(cookies="test")
+        client.generate_image(GenerateImageRequest(prompt="a cat", model=model))
+        payload = mock_request.call_args[1]["json_payload"]
+        assert payload["requests"][0]["imageModelName"] == wire
+
+    @patch.object(FlowClient, '_ensure_project', return_value="proj-123")
+    @patch.object(FlowClient, '_ensure_token')
+    def test_rejects_unknown_image_model(self, mock_token, mock_proj):
+        client = FlowClient(cookies="test")
+        with pytest.raises(ValueError, match="unknown Flow image model"):
+            client.generate_image(GenerateImageRequest(prompt="a cat", model="imagen-4"))
 
 
 class TestVideoPayload:

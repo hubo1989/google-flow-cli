@@ -14,11 +14,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger("gflow.auth.proxy")
 
-EXT_DIR = Path.home() / ".gflow" / "proxy-ext"
+
+def gflow_home() -> Path:
+    override = os.environ.get("GFLOW_HOME", "").strip()
+    return Path(override).expanduser() if override else Path.home() / ".gflow"
+
+
+def ext_dir() -> Path:
+    return gflow_home() / "proxy-ext"
+
+
+EXT_DIR = ext_dir()  # Backward-compatible constant; resolve GFLOW_HOME at call time.
 
 
 def create_proxy_extension(host: str, port: int, username: str, password: str,
@@ -35,7 +46,8 @@ def create_proxy_extension(host: str, port: int, username: str, password: str,
     Returns:
         Path to the extension directory (for --load-extension)
     """
-    EXT_DIR.mkdir(parents=True, exist_ok=True)
+    target = ext_dir()
+    target.mkdir(parents=True, exist_ok=True)
 
     # Manifest V3
     manifest = {
@@ -82,11 +94,11 @@ chrome.webRequest.onAuthRequired.addListener(
 );
 """
 
-    (EXT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    (EXT_DIR / "background.js").write_text(background_js)
+    (target / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (target / "background.js").write_text(background_js)
 
-    logger.info("Proxy extension created at %s (-> %s:%d)", EXT_DIR, host, port)
-    return str(EXT_DIR)
+    logger.info("Proxy extension created at %s (-> %s:%d)", target, host, port)
+    return str(target)
 
 
 def get_chrome_proxy_args() -> list[str]:

@@ -62,6 +62,35 @@ gflow list
 gflow download <asset-id> -o output.png
 ```
 
+## magpie provider plugin
+
+`magpie-plugin/` turns gflow into a magpie provider with three native image
+models: `gflow/nano-banana-pro`, `gflow/nano-banana-2.1`, and
+`gflow/nano-banana-2-lite`. Accounts are managed in magpie's
+`plugin-auth.json`; Veo video generation remains in MCP tools. Browser sign-in
+saves the Cookie as soon as CDP sees a valid Flow session; the account email is
+read best-effort from the Flow app shell and the live page, then stored as
+`metadata.email` for magpie's account display name. A missing email or credit
+token never aborts sign-in. `auth.usage` reads remaining credits from the
+`nzlxg` batchexecute RPC, shows them on magpie's Usage page, and backfills an
+old account's empty `metadata.email` through the host `auth.set` SDK. Setup,
+sign-in, limitations and rollback are in [`magpie-plugin/README.md`](magpie-plugin/README.md).
+
+```bash
+python3 -m pip install -e .
+magpie plugin add ./magpie-plugin
+# In magpie Settings → Providers → Google Flow, add the account's Cookie header.
+magpie tool generate_image --model gflow/nano-banana-2.1 --prompt "a cat astronaut"
+magpie tool generate_image --model gflow/nano-banana-pro --prompt "a cat astronaut"
+```
+
+The provider uses `python3 -m gflow.magpie_bridge`, which reads a JSON request
+and the account cookies from stdin and returns OpenAI-style `b64_json` images.
+It is non-interactive: a live per-account Flow Chrome/CDP session is required
+for reCAPTCHA, and no browser is launched during a request. The CLI's global
+`~/.gflow` session is still used by video MCP tools; `GFLOW_HOME` isolates the
+provider's per-account browser/proxy state when set by the bridge.
+
 ## Setup: Discovering RPC IDs
 
 Google Flow uses the same BatchExecute protocol as NotebookLM, but with different RPC endpoint IDs. You need to discover these by inspecting network traffic:
@@ -90,7 +119,7 @@ gflow raw "xYz123" --args '["my prompt", "16:9"]'
 | `gflow auth` | Authenticate with Google Flow |
 | `gflow auth --status` | Check auth status |
 | `gflow auth --clear` | Clear saved credentials |
-| `gflow generate-image PROMPT` | Generate images (Imagen 4) |
+| `gflow generate-image PROMPT [--model ID]` | Generate images (Pro / 2.1 / 2 Lite) |
 | `gflow generate-video PROMPT` | Generate videos (Veo 3.1) |
 | `gflow list` | List assets in your library |
 | `gflow get ASSET_ID` | Get asset details |

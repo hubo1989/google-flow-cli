@@ -44,3 +44,25 @@ generate_intro.bat
 intro_script.md
 ship_to_github.bat
 *.bat
+
+# ── Local work artifacts (never published) ────
+*-artifacts/
+.gflow-*-baseline/
+.gflow-*baseline*/
+*.patch
+*.diff.txt
+ROLLBACK*.sh
+VERIFICATION*.txt
+RECOVERY*.md
+baseline-hashes.json
+current-hashes.json
+TRANSACTION.json
+*.tar.gz
+host-source/
+host-*-source/
+host-baseline/
+host-modified/
+host-current*/
+host-0.1.*/
+bin/
+magpie-plugin/downloaded_files/

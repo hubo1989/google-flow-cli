@@ -42,9 +42,36 @@ logger = logging.getLogger("gflow.auth")
 FLOW_HOST = "labs.google"
 FLOW_URL = "https://labs.google/fx/tools/flow"
 SESSION_URL = "https://labs.google/fx/api/auth/session"
-ENV_DIR = Path.home() / ".gflow"
-ENV_FILE = ENV_DIR / "env"
-CDP_PORT_FILE = ENV_DIR / "cdp-port"
+
+
+def gflow_home() -> Path:
+    """Return this process's gflow state directory.
+
+    The magpie bridge sets GFLOW_HOME to a private, per-account directory so
+    several Flow accounts can use CDP and proxy state without colliding.  The
+    ordinary CLI keeps its historical ~/.gflow location when unset.
+    """
+    override = os.environ.get("GFLOW_HOME", "").strip()
+    return Path(override).expanduser() if override else Path.home() / ".gflow"
+
+
+def env_dir() -> Path:
+    """Resolve the active home on each call, so a child process can set it."""
+    return gflow_home()
+
+
+def env_file() -> Path:
+    return env_dir() / "env"
+
+
+def cdp_port_file() -> Path:
+    return env_dir() / "cdp-port"
+
+
+# Backward-compatible module constants for callers that predate GFLOW_HOME.
+ENV_DIR = env_dir()
+ENV_FILE = env_file()
+CDP_PORT_FILE = cdp_port_file()
 
 
 @dataclass
@@ -173,36 +200,100 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+DEVTOOLS_ACTIVE_PORT = "DevToolsActivePort"
+
+
+def _read_devtools_active_port(profile_dir: str | Path, timeout: float = 20.0) -> int | None:
+    """Read the port Chrome chose for ``--remote-debugging-port=0``.
+
+    Chrome writes ``<profile>/DevToolsActivePort`` once its endpoint is up, so
+    this is the only reliable way to learn the port.  A port picked by the
+    caller can belong to a different process: a launch that hands off to an
+    existing instance holding the profile lock exits 0 and never listens on
+    the caller's port, which is what produced "login browser is not running".
+    """
+    path = Path(profile_dir) / DEVTOOLS_ACTIVE_PORT
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            first = path.read_text().splitlines()[0].strip()
+            port = int(first)
+            if 0 < port < 65536:
+                return port
+        except (OSError, ValueError, IndexError):
+            pass
+        time.sleep(0.05)
+    return None
+
+
+def wait_for_cdp_ready(port: int, timeout: float = 20.0) -> bool:
+    """Return True once Chrome answers HTTP on its CDP port.
+
+    ``get_saved_cdp_port`` only checks that *something* accepts a TCP
+    connection.  Chrome opens that socket slightly before the CDP HTTP
+    handler answers, so a caller connecting immediately can still fail.
+    """
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{port}/json/version"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.5) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(0.05)
+    return False
+
+
 # ------------------------------------------------------------------
 # CDP port persistence
 # ------------------------------------------------------------------
 
-def get_saved_cdp_port() -> int | None:
-    """Get the saved CDP port from a previous auth session."""
-    if not CDP_PORT_FILE.exists():
+def read_saved_cdp_port() -> int | None:
+    """Return the persisted port without probing it.
+
+    Callers that intend to wait for CDP (``browser_login_wait``) need the raw
+    value: a freshly launched Chrome can take a moment to answer, and probing
+    here with a short timeout would report "not running" for a browser that is
+    merely still starting.
+    """
+    if not cdp_port_file().exists():
         return None
     try:
-        port = int(CDP_PORT_FILE.read_text().strip())
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            result = s.connect_ex(("127.0.0.1", port))
-            if result == 0:
-                return port
+        port = int(cdp_port_file().read_text().strip())
     except (ValueError, OSError):
-        pass
-    return None
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def get_saved_cdp_port() -> int | None:
+    """Get the saved CDP port from a previous auth session.
+
+    A TCP accept is not enough: Chrome binds the socket before its CDP HTTP
+    handler answers, and a reused port may already belong to another process.
+    Require the port to answer ``/json/version`` before reporting it usable.
+    """
+    port = read_saved_cdp_port()
+    if not port:
+        return None
+    return port if wait_for_cdp_ready(port, timeout=1.5) else None
 
 
 def save_cdp_port(port: int) -> None:
     """Save the CDP debugging port for reuse."""
-    ENV_DIR.mkdir(parents=True, exist_ok=True)
-    CDP_PORT_FILE.write_text(str(port))
+    home = env_dir()
+    home.mkdir(parents=True, exist_ok=True)
+    cdp_port_file().write_text(str(port))
 
 
 def clear_cdp_port() -> None:
     """Remove the saved CDP port file."""
-    if CDP_PORT_FILE.exists():
-        CDP_PORT_FILE.unlink()
+    if cdp_port_file().exists():
+        cdp_port_file().unlink()
 
 
 # ------------------------------------------------------------------
@@ -217,12 +308,14 @@ class _CDPConnection:
         self._ws = websocket.create_connection(ws_url, timeout=30)
         self._msg_id = 0
 
-    def send(self, method: str, params: dict | None = None) -> dict:
-        """Send CDP command, return result."""
+    def send(self, method: str, params: dict | None = None, session_id: str | None = None) -> dict:
+        """Send CDP command, optionally to an attached target session."""
         self._msg_id += 1
         msg = {"id": self._msg_id, "method": method}
         if params:
             msg["params"] = params
+        if session_id:
+            msg["sessionId"] = session_id
         self._ws.send(json.dumps(msg))
 
         deadline = time.time() + 30
@@ -250,8 +343,44 @@ class _CDPConnection:
             pass
 
 
-def _wait_for_cdp_page(port: int, timeout: int = 30) -> str:
-    """Wait for a page-level CDP WebSocket URL."""
+def _browser_cdp_ws_url(port: int) -> str:
+    """Return the browser-level CDP WebSocket for cookie/target inspection."""
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as resp:
+        version = json.loads(resp.read().decode())
+    ws_url = version.get("webSocketDebuggerUrl", "")
+    if not ws_url:
+        raise AuthError(f"Chrome CDP browser WebSocket missing on port {port}")
+    return ws_url
+
+
+def _wait_for_browser_cdp(port: int, timeout: int = 30) -> str:
+    """Wait for Chrome's browser-level CDP WebSocket.
+
+    Browser-level Storage.getCookies and Target.getTargets keep working while
+    Google's sign-in flow replaces or closes the only page target.  Page-level
+    WebSockets do not, and the first /json/list page is often a sign-in
+    challenge or an error page.
+    """
+    deadline = time.time() + timeout
+    last_error = "CDP not available"
+    while time.time() < deadline:
+        try:
+            return _browser_cdp_ws_url(port)
+        except Exception as exc:  # Chrome may still be starting
+            last_error = sanitize_cdp_error(exc)
+        time.sleep(0.5)
+    raise AuthError(f"Chrome CDP not available after {timeout}s on port {port}: {last_error}")
+
+
+def sanitize_cdp_error(exc: BaseException) -> str:
+    """Keep local CDP errors short; never echo a page URL with login state."""
+    return str(exc).replace("\n", " ")[:160] or exc.__class__.__name__
+
+
+def _wait_for_cdp_page(port: int, timeout: float = 30, target_url: str | None = None) -> str:
+    """Wait for a page endpoint, optionally requiring this launch's exact URL."""
     import urllib.request
     import urllib.error
 
@@ -262,7 +391,8 @@ def _wait_for_cdp_page(port: int, timeout: int = 30) -> str:
             resp = urllib.request.urlopen(url, timeout=2)
             targets = json.loads(resp.read().decode())
             for target in targets:
-                if target.get("type") == "page":
+                if (target.get("type") == "page"
+                        and (target_url is None or target.get("url") == target_url)):
                     ws_url = target.get("webSocketDebuggerUrl", "")
                     if ws_url:
                         return ws_url
@@ -326,7 +456,7 @@ class BrowserAuth:
         auth = load_env()
         if auth and auth.is_valid:
             if self.debug:
-                logger.info("Using saved cookies from %s", ENV_FILE)
+                logger.info("Using saved cookies from %s", env_file())
             return auth
 
         if interactive:
@@ -370,7 +500,7 @@ class BrowserAuth:
         chrome_path = _get_chrome_path()
         cdp_port = _find_free_port()
 
-        profile_dir = str(ENV_DIR / "chrome-profile")
+        profile_dir = str(env_dir() / "chrome-profile")
 
         # Build Chrome args — NO chromedriver, NO Selenium
         args = [
@@ -490,7 +620,7 @@ class BrowserAuth:
                     print(f"  User: {user.get('name', 'Unknown')} ({user.get('email', '')})")
                     print(f"  Token: {session_data['access_token'][:20]}...")
                     print(f"  Cookies: {len(all_cookies)} captured")
-                    print(f"  Saved to: {ENV_FILE}")
+                    print(f"  Saved to: {env_file()}")
                     print()
                     print("  Chrome stays open for reCAPTCHA. Run 'gflow close' when done.")
                     print()
@@ -523,6 +653,51 @@ class BrowserAuth:
         finally:
             cdp.close()
 
+
+def _verify_cookies_via_page(cdp: "_CDPConnection", cookie_str: str) -> dict | None:
+    """Confirm cookie_str is a signed-in Flow session using the live page.
+
+    The rendered flow.google.com page carries ``WIZ_global_data.SNlM0e``
+    (the static shell HTML does not), and one nzlxg batchexecute call with
+    those exact cookies answers 200 only for a signed-in session. Returns a
+    truthy dict on success, None when the page or RPC says otherwise.
+    """
+    try:
+        result = cdp.send("Runtime.evaluate", {
+            "expression": "JSON.stringify({at: window.WIZ_global_data && WIZ_global_data.SNlM0e, "
+                          "bl: window.WIZ_global_data && WIZ_global_data.cfb2h, "
+                          "fsid: window.WIZ_global_data && WIZ_global_data.FdrFJe})",
+            "returnByValue": True,
+        })
+        page = json.loads(result.get("result", {}).get("value") or "{}")
+    except Exception as exc:
+        logger.warning("CDP page token read failed: %s", exc)
+        return None
+    at = str(page.get("at") or "")
+    if not at:
+        return None
+    import requests as _requests
+    from urllib.parse import urlencode
+    from gflow.account_info import USER_AGENT
+    origin = "https://flow.google.com"
+    base = f"{origin}/_/AiSandboxAngularFrontend/data/batchexecute"
+    query = urlencode({"rpcids": "nzlxg", "source-path": "/", "bl": page.get("bl") or "",
+                       "f.sid": page.get("fsid") or "", "hl": "en", "rt": "c"})
+    body = urlencode({"f.req": json.dumps([[["nzlxg", "[]", None, "generic"]]]), "at": at})
+    try:
+        resp = _requests.post(f"{base}?{query}", data=body, timeout=20, allow_redirects=False,
+                              headers={"Cookie": cookie_str, "User-Agent": USER_AGENT,
+                                       "Accept": "*/*", "Content-Type":
+                                       "application/x-www-form-urlencoded;charset=UTF-8",
+                                       "Origin": origin, "Referer": f"{origin}/",
+                                       "X-Same-Domain": "1"})
+    except Exception as exc:
+        logger.warning("CDP cookie verify RPC failed: %s", exc)
+        return None
+    if resp.status_code == 200:
+        return {"verified": True}
+    logger.warning("CDP cookie verify RPC: HTTP %s", resp.status_code)
+    return None
 
 def refresh_cookies_from_cdp() -> AuthData | None:
     """
@@ -566,26 +741,24 @@ def refresh_cookies_from_cdp() -> AuthData | None:
             logger.warning("CDP cookie refresh: Chrome running but no Google auth cookies")
             return None
 
+        # Verify the cookies actually work before returning them. The old
+        # labs.google session endpoint returns 410 (deprecated 2026-10), so
+        # the check is now the same nzlxg RPC the Flow menu itself makes,
+        # with the SNlM0e token from the rendered page.
         cookie_str = "; ".join(f'{c["name"]}={c["value"]}' for c in all_cookies)
-
-        # Verify the cookies actually work before returning them
         try:
-            session_data = refresh_access_token(cookie_str, debug=False)
-            if session_data.get("access_token"):
+            session_data = _verify_cookies_via_page(cdp, cookie_str)
+            if session_data is not None:
                 logger.info(
                     "Silent CDP cookie refresh successful (%d cookies)",
                     len(all_cookies),
                 )
-                auth = AuthData(
-                    cookies=cookie_str,
-                    token=session_data["access_token"],
-                    expires=session_data.get("expires", ""),
-                )
+                auth = AuthData(cookies=cookie_str, token="", expires="")
                 # Persist refreshed cookies so next startup uses them
                 save_env(auth)
                 return auth
         except AuthError:
-            logger.warning("CDP cookie refresh: cookies extracted but session endpoint rejected them")
+            logger.warning("CDP cookie refresh: cookies extracted but the page RPC rejected them")
             return None
 
     except Exception as e:
@@ -595,27 +768,34 @@ def refresh_cookies_from_cdp() -> AuthData | None:
         cdp.close()
 
 
-def kill_auth_browser() -> None:
-    """Kill the Chrome browser that was kept alive for reCAPTCHA."""
+def kill_auth_browser(timeout: float = 8.0) -> None:
+    """Close the Chrome kept alive for reCAPTCHA, then wait for it to exit.
+
+    ``Browser.close`` is asynchronous.  Returning immediately let the next
+    launch race the still-held ``--user-data-dir`` lock: Chrome then handed
+    the new process off to the dying instance, exited 0, and never listened
+    on the new debugging port.  Wait until the port stops answering.
+    """
     port = get_saved_cdp_port()
-    if not port:
-        clear_cdp_port()
-        return
+    if port:
+        try:
+            import urllib.request
+            url = f"http://127.0.0.1:{port}/json/version"
+            resp = urllib.request.urlopen(url, timeout=2)
+            data = json.loads(resp.read().decode())
+            ws_url = data.get("webSocketDebuggerUrl", "")
 
-    try:
-        import urllib.request
-        url = f"http://127.0.0.1:{port}/json/version"
-        resp = urllib.request.urlopen(url, timeout=2)
-        data = json.loads(resp.read().decode())
-        ws_url = data.get("webSocketDebuggerUrl", "")
+            if ws_url:
+                import websocket
+                ws = websocket.create_connection(ws_url, timeout=5)
+                ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                ws.close()
+        except Exception:
+            pass
 
-        if ws_url:
-            import websocket
-            ws = websocket.create_connection(ws_url, timeout=5)
-            ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
-            ws.close()
-    except Exception:
-        pass
+        deadline = time.time() + timeout
+        while time.time() < deadline and wait_for_cdp_ready(port, timeout=0.3):
+            time.sleep(0.1)
 
     clear_cdp_port()
 
@@ -631,23 +811,23 @@ class AuthError(Exception):
 
 def save_env(auth: AuthData) -> None:
     """Save authentication credentials to ~/.gflow/env."""
-    ENV_DIR.mkdir(parents=True, exist_ok=True)
-    ENV_FILE.write_text(
+    env_dir().mkdir(parents=True, exist_ok=True)
+    env_file().write_text(
         f"GFLOW_COOKIES={auth.cookies}\n",
     )
     try:
-        ENV_FILE.chmod(0o600)
+        env_file().chmod(0o600)
     except OSError:
         pass
 
 
 def load_env() -> AuthData | None:
     """Load authentication credentials from ~/.gflow/env."""
-    if not ENV_FILE.exists():
+    if not env_file().exists():
         return None
 
     cookies = ""
-    for line in ENV_FILE.read_text().splitlines():
+    for line in env_file().read_text().splitlines():
         line = line.strip()
         if line.startswith("GFLOW_COOKIES="):
             cookies = line[len("GFLOW_COOKIES="):]
@@ -661,9 +841,9 @@ def clear_env() -> None:
     """Remove saved authentication credentials."""
     kill_auth_browser()
 
-    if ENV_FILE.exists():
-        ENV_FILE.unlink()
-    profile_dir = ENV_DIR / "chrome-profile"
+    if env_file().exists():
+        env_file().unlink()
+    profile_dir = env_dir() / "chrome-profile"
     if profile_dir.exists():
         import shutil
         try:
